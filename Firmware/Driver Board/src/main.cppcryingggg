@@ -1,0 +1,306 @@
+#include <Arduino.h>z
+#include <SPI.h>
+
+#ifdef MILLIS_USE_TIMERA0 // Uses timer B0
+  #error "This implementation takes over TCA0 - please use a different timer for millis"
+#endif
+
+#define MODULE_WIDTH      5
+#define MODULE_HEIGHT     7
+#define SEGMENTS                (MODULE_WIDTH * MODULE_HEIGHT)
+
+// Pin definitions
+#define RCLK               0
+#define SRCLR            6
+#define ADDR_0          1
+#define ADDR_1          2
+#define ADDR_2          3
+
+// Colour values
+#define BLACK 0
+#define YELLOW 1
+
+// Timing constants
+#define DEAD_TIME_US 10
+#define DUTCY_CYCLE_RATIO 100
+
+#define SR_QUEUE_LEN SEGMENTS + 1
+
+// Shift register contol offsets
+static const int rowHigh[7] = {17, 18, 19, 20, 3, 2, 1};
+static const int rowLow[7] = {26, 25, 27, 28, 9, 10, 11};
+
+static const int colHigh[5] = {7, 6, 5, 22, 23};
+static const int colLow[5] = {15, 14, 13, 30, 31};
+
+// Protocol configuration options
+#define RASTER_MODE_HORIZONTAL false
+#define RASTER_MODE_VERTICAL true
+
+#define DATA_JUSTIFICATION_LSB false
+#define DATA_JUSTIFICATION_MSB true
+
+#define HORIZONTAL_DIRECTION_LSB_LEFT false
+#define HORIZONTAL_DIRECTION_MSB_LEFT true
+
+#define VERTICAL_DIRECTION_LSB_BOTTOM false
+#define VERTICAL_DIRECTION_MSB_BOTTOM true
+
+bool raster_mode = RASTER_MODE_HORIZONTAL;
+bool data_justification = DATA_JUSTIFICATION_LSB;
+bool horizontal_direction = HORIZONTAL_DIRECTION_LSB_LEFT;
+bool vertical_direction = VERTICAL_DIRECTION_LSB_BOTTOM;
+
+struct segment{
+  uint32_t sr_frame;
+  uint8_t cooldown;
+  bool state = true;
+  bool buffer;
+};
+
+// Shift register queue and index
+segment* sr_queue[SR_QUEUE_LEN] = {0};
+uint8_t sr_queue_exec_index = 0; // index of last exectued sr val
+uint8_t sr_queue_write_index = 0; // index of last written sr val
+
+segment segments[MODULE_WIDTH][MODULE_HEIGHT];
+
+uint16_t flip_in_time_us = 500;
+
+uint8_t address = 0;
+
+uint8_t data_in;                                    // for incoming serial data
+uint8_t reg_sel;                                    // Selected register
+bool reg_write_en = false;                  // Register write enable
+
+void inc_exec_index() {
+  sr_queue_exec_index = (sr_queue_exec_index + 1)%SR_QUEUE_LEN;
+}
+
+void inc_write_index() {
+  sr_queue_write_index = (sr_queue_write_index + 1)%SR_QUEUE_LEN;
+}
+
+/**
+*   \brief Converts microseconds into TCA0 value
+*   
+*   \param us Time in microseconds
+*
+*   \return Timer value
+**/
+uint16_t counter_us_to_val(uint16_t us) {
+  return us * 10;
+}
+
+/**
+*   \brief Shift 32 bits over SPI
+*
+*   Shift 32 bits to registers in 8 bit chunks
+*   
+*   \param val Value to write.
+*
+**/
+void shift32(uint32_t val) {  // 
+  uint8_t shift = 32U; 
+  do {
+      shift -= 8U;
+      SPI.transfer((uint8_t)(val >> shift));
+  } while ( shift ) ;
+}
+
+/**
+*   \brief Pulse RCLK
+**/
+  void clockRegisters() {
+    digitalWrite(RCLK, HIGH);
+    digitalWrite(RCLK, LOW);
+  }
+
+/**
+*   \brief Generate shift register state to flip a single segment
+*
+*   Generate shift register state to flip a single segment. Protects against H-bridge short circuits.
+*   
+*   \param seg_x Segment x position.
+*   \param seg_y Segment y position.
+*   \param seg_val Set value.
+*
+*   \returns 32-bit sequence that configures shift registers for the correct action
+**/
+uint32_t gen_register_state(uint8_t seg_x, uint8_t seg_y, bool seg_val) {
+  uint32_t register_state = 0;
+  if (seg_val) {
+    register_state = register_state | ((uint32_t)1 << colLow[seg_x]);
+    register_state = register_state & ~((uint32_t)1 << colHigh[seg_x]);
+
+    register_state = register_state | ((uint32_t)1 << rowHigh[seg_y]);
+    register_state = register_state & ~((uint32_t)1 << rowLow[seg_y]);
+  } 
+  else {
+    register_state = register_state | ((uint32_t)1 << colHigh[seg_x]);
+    register_state = register_state & ~((uint32_t)1 << colLow[seg_x]);
+
+    register_state = register_state | ((uint32_t)1 << rowLow[seg_y]);
+    register_state = register_state & ~((uint32_t)1 << rowHigh[seg_y]);
+  } 
+  return register_state;
+}
+
+void queue_segment(uint8_t seg_x, uint8_t seg_y) {
+  segment *seg = &segments[seg_x][seg_y];
+  inc_write_index();
+  sr_queue[sr_queue_write_index] = seg;
+}
+
+void set_segment(uint8_t seg_x, uint8_t seg_y, bool val) {
+  segment *seg = &segments[seg_x][seg_y];
+  if (seg->state == val) {
+    return;
+  }
+  seg->buffer = val;
+  seg->sr_frame = gen_register_state(seg_x, seg_y, seg->buffer);
+  if (seg->cooldown == 0) {
+    seg->cooldown = 1;
+  }
+  queue_segment(seg_x, seg_y);
+}
+
+void check_segment(uint8_t seg_x, uint8_t seg_y) {
+  segment *seg = &segments[seg_x][seg_y];
+  if (seg->state == seg->buffer) {
+    return;
+  }
+  seg->sr_frame = gen_register_state(seg_x, seg_y, seg->buffer);
+  if (seg->cooldown == 0) {
+    seg->cooldown = 1;
+  }
+  queue_segment(seg_x, seg_y);
+}
+
+
+void parse_reg_sel() {
+  if ((data_in & 0b01110000) >> 4 == address) {
+    reg_write_en = false;
+    return;
+  }
+  reg_sel = data_in & 0b00001111;
+  if (reg_sel == 7) {
+    /// TODO: Draw all segments again
+  }
+  else {
+    reg_write_en = true;
+  }
+}
+
+void put_run(uint8_t run_index, uint8_t buffer) {
+  if(raster_mode == RASTER_MODE_HORIZONTAL) {
+    uint8_t new_run_index;
+    if (vertical_direction == VERTICAL_DIRECTION_LSB_BOTTOM) {
+      new_run_index = run_index;
+    }
+    else {
+      new_run_index = MODULE_HEIGHT - run_index - 1;
+    }
+    for (uint8_t col = 0; col < 5; col ++) {
+      set_segment(col, new_run_index, bitRead(buffer, col));
+    }
+  }
+  else {
+    ///TODO: implement
+  }
+}
+
+void parse_reg_write() {
+  if (reg_sel <= 6) {
+    put_run(reg_sel, data_in);
+    reg_sel ++;
+    reg_sel = reg_sel % 7;
+  }
+  if (reg_sel == 8) {
+    //set_protocol_config(data_in);
+    /// TODO:implement procotocol config
+  }
+  if (reg_sel == 9) {
+/*     int us_per_flip = (1000000/DUTCY_CYCLE_RATIO)/data_in;
+    us_per_flip -= 2*DEAD_TIME_US;
+    us_per_flip = constrain(us_per_flip, 1, 5000);
+    flip_on_time_us = us_per_flip;
+    TCA0.SINGLE.PER = counter_us_to_val(flip_on_time_us + DEAD_TIME_US); //count from top
+    TCA0.SINGLE.CMP0 = counter_us_to_val(DEAD_TIME_US); //compare at midpoint
+ */ 
+/// TODO: implement framerate 
+  }
+}
+
+void setup() {
+  _PROTECTED_WRITE(CLKCTRL_MCLKCTRLB, CLKCTRL_PEN_bm);  // Set 10 MHz clock
+
+  pinMode(RCLK, OUTPUT);
+  pinMode(SRCLR, OUTPUT);
+
+  pinMode(ADDR_0, INPUT_PULLUP);
+  pinMode(ADDR_1, INPUT_PULLUP);
+  pinMode(ADDR_2, INPUT_PULLUP);
+
+  address = digitalRead(ADDR_0) | digitalRead(ADDR_1) << 1 | digitalRead(ADDR_2) << 2;
+
+  digitalWrite(SRCLR, HIGH);
+  SPI.begin();
+
+  Serial.begin(115200);
+
+  takeOverTCA0();
+  //TCA0.SINGLE.CTRLB = (TCA_SINGLE_WGMODE_NORMAL_gc); //Normal mode counter - default
+  TCA0.SINGLE.CTRLESET = TCA_SINGLE_DIR_DOWN_gc;
+  TCA0.SINGLE.INTCTRL = (TCA_SINGLE_CMP0_bm | TCA_SINGLE_OVF_bm); // enable compare channel 0 and overflow interrupts
+
+  TCA0.SINGLE.PER = counter_us_to_val(flip_in_time_us + DEAD_TIME_US); //count from top
+  TCA0.SINGLE.CMP0 = counter_us_to_val(DEAD_TIME_US); //compare at midpoint
+  //TCA0.SINGLE.CTRLA = TCA_SINGLE_ENABLE_bm; // enable the timer 100ns increments per step at 10MHz clock
+  TCA0.SINGLE.CTRLA = 1;
+}
+
+void loop() {
+  while (Serial.available()) {
+    data_in = Serial.read();
+    if (bitRead(data_in, 7)) {
+      parse_reg_sel();
+    }
+    else if (reg_write_en) {
+      parse_reg_write();
+    }
+  }
+}
+
+ISR(TCA0_OVF_vect) {    // on overflow, shift out next frame
+  TCA0.SINGLE.CTRLA = 0;
+  for (uint8_t col = 0; col < MODULE_WIDTH; col++) {
+    for (uint8_t row = 0; row < MODULE_HEIGHT; row++) {
+      if (segments[col][row].cooldown > 1) {
+        segments[col][row].cooldown --;
+      }
+      else {
+        segments[col][row].cooldown = 0;
+        check_segment(col, row);
+      }
+    }
+  } 
+  if (sr_queue_exec_index != sr_queue_write_index) {
+    inc_exec_index();
+    if (sr_queue[sr_queue_exec_index]){
+      shift32(sr_queue[sr_queue_exec_index]->sr_frame);
+      sr_queue[sr_queue_exec_index]->cooldown = DUTCY_CYCLE_RATIO;
+      sr_queue[sr_queue_exec_index]->state = sr_queue[sr_queue_exec_index]->buffer;
+    }
+    clockRegisters();
+    sr_queue[sr_queue_exec_index] = nullptr;
+  }
+  TCA0.SINGLE.CTRLA = 1;
+  TCA0.SINGLE.INTFLAGS  = TCA_SINGLE_OVF_bm; // Always remember to clear the interrupt flags, otherwise the interrupt will fire continually!
+}
+
+ISR(TCA0_CMP0_vect) {    // on compare, shift 0
+  shift32(0);
+  clockRegisters();
+  TCA0.SINGLE.INTFLAGS  = TCA_SINGLE_CMP0_bm; // Always remember to clear the interrupt flags, otherwise the interrupt will fire continually!
+}

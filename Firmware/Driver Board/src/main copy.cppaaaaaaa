@@ -1,0 +1,441 @@
+#include <Arduino.h>
+#include <SPI.h>
+
+#ifdef MILLIS_USE_TIMERA0 // Uses timer B0
+  #error "This implementation takes over TCA0 - please use a different timer for millis"
+#endif
+
+#define MODULE_WIDTH      5
+#define MODULE_HEIGHT     7
+#define SEGMENTS                (MODULE_WIDTH * MODULE_HEIGHT)
+
+// Pin definitions
+#define RCLK               0
+#define SRCLR            6
+#define ADDR_0          1
+#define ADDR_1          2
+#define ADDR_2          3
+
+// Colour values
+#define BLACK 0
+#define YELLOW 1
+
+// Timing constants
+#define DEAD_TIME_US 10
+
+// Shift register contol offsets
+static const int rowHigh[7] = {17, 18, 19, 20, 3, 2, 1};
+static const int rowLow[7] = {26, 25, 27, 28, 9, 10, 11};
+
+static const int colHigh[5] = {7, 6, 5, 22, 23};
+static const int colLow[5] = {15, 14, 13, 30, 31};
+
+// Protocol configuration options
+#define RASTER_MODE_HORIZONTAL false
+#define RASTER_MODE_VERTICAL true
+
+#define DATA_JUSTIFICATION_LSB false
+#define DATA_JUSTIFICATION_MSB true
+
+#define HORIZONTAL_DIRECTION_LSB_LEFT false
+#define HORIZONTAL_DIRECTION_MSB_LEFT true
+
+#define VERTICAL_DIRECTION_LSB_BOTTOM false
+#define VERTICAL_DIRECTION_MSB_BOTTOM true
+
+#define DUTCY_CYCLE_RATIO 100
+
+#define sr_queue_LEN SEGMENTS + 1
+
+// Configurables
+uint8_t address = 0;
+bool vertical = true;
+
+bool raster_mode = RASTER_MODE_HORIZONTAL;
+bool data_justification = DATA_JUSTIFICATION_LSB;
+bool horizontal_direction = HORIZONTAL_DIRECTION_LSB_LEFT;
+bool vertical_direction = VERTICAL_DIRECTION_LSB_BOTTOM;
+
+// Shift register queue and index
+uint32_t sr_queue[sr_queue_LEN] = {0};
+uint8_t sr_queue_exec_index = 0; // index of last exectued sr val
+uint8_t sr_queue_write_index = 0; // index of last written sr val
+
+// Frame strage buffers
+uint8_t state_buf[5] = {0b01111111};
+uint8_t frame_buf[5] = {0b00000000};
+
+// 
+uint8_t seg_cooldown[MODULE_HEIGHT][MODULE_WIDTH] = {{0b00000001}};
+
+// Timing configuration
+uint16_t flip_on_time_us = 500;   //Flip time spent passing current through coils - 1us resolution
+
+// Protocol configuration:
+// - Bit 0: raster mode
+//   > 0: 5-bit horizontal registers
+//   > 1: 7-bit vertical registers - uses registers 0-4
+// - Bit 1: Data justification in 5-bit register mode
+//   > 0: LSB justification
+//   > 1: MSB justification
+// - Bit 2: Horizontal direction
+//   > 0: LSB represents leftmost pixel
+//   > 1: MSB represents leftmost pixel
+// - Bit 3: Vertical direction
+//   > 0: LSB represents bottom pixel
+//   > 1: MSB represents bottom pixel
+uint8_t protocol_config = 0;
+
+uint8_t data_in;                                    // for incoming serial data
+uint8_t reg_sel;                                    // Selected register
+bool reg_write_en = false;                  // Register write enable
+
+/**
+*   \brief Shift 32 bits over SPI
+*
+*   Shift 32 bits to registers in 8 bit chunks
+*   
+*   \param val Value to write.
+*
+**/
+void shift32(uint32_t val) {  // 
+  uint8_t shift = 32U; 
+  do {
+      shift -= 8U;
+      SPI.transfer((uint8_t)(val >> shift));
+  } while ( shift ) ;
+}
+
+/**
+*   \brief Pulse RCLK
+**/
+  void clockRegisters() {
+    digitalWrite(RCLK, HIGH);
+    digitalWrite(RCLK, LOW);
+  }
+
+/**
+*   \brief Generate shift register state to flip a single segment
+*
+*   Generate shift register state to flip a single segment. Protects against H-bridge short circuits.
+*   
+*   \param seg_x Segment x position.
+*   \param seg_y Segment y position.
+*   \param seg_val Set value.
+*
+*   \returns 32-bit sequence that configures shift registers for the correct action
+**/
+uint32_t gen_register_state(uint8_t seg_x, uint8_t seg_y, bool seg_val) {
+  uint32_t register_state = 0;
+  if (seg_val) {
+    register_state = register_state | ((uint32_t)1 << colLow[seg_x]);
+    register_state = register_state & ~((uint32_t)1 << colHigh[seg_x]);
+
+    register_state = register_state | ((uint32_t)1 << rowHigh[seg_y]);
+    register_state = register_state & ~((uint32_t)1 << rowLow[seg_y]);
+  } 
+  else {
+    register_state = register_state | ((uint32_t)1 << colHigh[seg_x]);
+    register_state = register_state & ~((uint32_t)1 << colLow[seg_x]);
+
+    register_state = register_state | ((uint32_t)1 << rowLow[seg_y]);
+    register_state = register_state & ~((uint32_t)1 << rowHigh[seg_y]);
+  } 
+  return register_state;
+}
+
+void next_sr_index(uint8_t &index) {
+  index ++;
+  index = index % sr_queue_LEN;
+}
+
+void queue_flip(uint32_t register_state) {
+  next_sr_index(sr_queue_write_index);
+  sr_queue[sr_queue_write_index] = register_state;
+}
+
+void set_segment(uint8_t seg_x, uint8_t seg_y, bool val) {
+  if (bitRead(state_buf[seg_x], seg_y) == val) {
+    return;
+  }
+  bitWrite(state_buf[seg_x], seg_y, val);
+  queue_flip(gen_register_state(seg_x, seg_y, val));
+}
+
+void set_segment(uint8_t seg_x, uint8_t seg_y) {
+  bool val = bitRead(frame_buf[seg_x], seg_y);
+  set_segment(seg_x, seg_y, val);
+}
+
+/**
+*   \brief Increment/decrement variable in a direction
+*   
+*   \param var Variable to change
+*   \param direction Direction of change - True for increment, False for decrement
+*
+**/
+template <typename T>
+void increment_direction (T &var, bool direction) {
+  if (direction) {
+    var ++;
+  } else {
+    var --;
+  }
+}
+
+/**
+*   \brief decide whether to continue iterating
+*   
+*   \param current current position
+*   \param target target position
+*   \param direction Direction of change - True for increment, False for decrement
+*
+*   \return continue or not
+**/
+bool continue_iterate (uint8_t current, uint8_t target, bool direction) {
+  if (direction) {
+    return (current <= target);
+  } else {
+    return (current >= target);
+  }
+}
+
+uint8_t normalise_write(uint8_t val) {
+  uint8_t normalised_scan = 0; // LSB justified, LSB bottom/left pixel data
+  uint8_t data_start_bit;
+  uint8_t data_end_bit;
+  bool data_iteration_direction;
+  if (raster_mode == RASTER_MODE_VERTICAL) {
+    if (vertical_direction == VERTICAL_DIRECTION_LSB_BOTTOM) {
+      data_start_bit = 0;
+      data_end_bit = 6;
+    } else {
+      data_start_bit = 6;
+      data_end_bit = 0;
+    }
+  } else {
+    uint8_t data_offset;
+    if(data_justification == DATA_JUSTIFICATION_LSB) {
+      data_offset = 0;
+    } else {
+      data_offset = 2;
+    }
+    if (horizontal_direction == HORIZONTAL_DIRECTION_LSB_LEFT) {
+      data_start_bit = 0 + data_offset;
+      data_end_bit = 4 + data_offset;
+    } else {
+      data_start_bit = 4 + data_offset;
+      data_end_bit = 0 + data_offset;
+    }
+  }
+  data_iteration_direction = (data_end_bit > data_start_bit);
+  for (
+    uint8_t input_bit = data_start_bit, output_index = 0; 
+    continue_iterate(input_bit, data_end_bit, data_iteration_direction) && output_index < 8; 
+    increment_direction<uint8_t>(input_bit, data_iteration_direction), output_index++
+  ) {
+    bitWrite(normalised_scan, output_index, bitRead(val, input_bit));
+  }
+  return normalised_scan;
+}
+
+void reg_write(uint8_t reg, uint8_t val) {
+  uint8_t normalised_scan = normalise_write(val);
+
+  if (raster_mode == RASTER_MODE_VERTICAL) {
+    if (horizontal_direction == HORIZONTAL_DIRECTION_LSB_LEFT) {  
+      frame_buf[reg] = normalised_scan;
+    } else {
+      frame_buf[4 - reg] = normalised_scan;
+    }
+  } else {
+    for(int i = 0; i < 5; i ++) {
+      uint8_t buffer_index;
+      if (horizontal_direction == HORIZONTAL_DIRECTION_LSB_LEFT) {
+        buffer_index = i;
+      } else {  
+        buffer_index = 4-i;
+      }
+
+      if (vertical_direction == VERTICAL_DIRECTION_LSB_BOTTOM) {
+        bitWrite(frame_buf[buffer_index], reg, bitRead(normalised_scan, i));
+        set_segment(buffer_index, reg);
+      } else {
+        bitWrite(frame_buf[buffer_index], 6-reg, bitRead(normalised_scan, i));
+        set_segment(buffer_index, 6-reg);
+      }
+    }
+  }
+}
+
+void handle_selection(uint8_t data_in) {
+  if ((data_in & 0b01110000) >> 4 == address) {
+    reg_write_en = true;
+    reg_sel = data_in & 0b00001111;
+    if (reg_sel == 7) {
+      ///TODO: redraw all segments
+      reg_write_en = false;
+    }
+  }
+  else {
+    reg_write_en = false;
+  }
+}
+
+void set_protocol_config(uint8_t data_in) {
+  if(bitRead(data_in, 0)) {
+    raster_mode = RASTER_MODE_VERTICAL;
+  }
+  else {
+    raster_mode = RASTER_MODE_HORIZONTAL;
+  }
+  if(bitRead(data_in, 1)) {
+    data_justification = DATA_JUSTIFICATION_MSB;
+  }
+  else {
+    data_justification = DATA_JUSTIFICATION_LSB;
+  }
+  if(bitRead(data_in, 2)) {
+    horizontal_direction = HORIZONTAL_DIRECTION_MSB_LEFT;
+  }
+  else {
+    horizontal_direction = HORIZONTAL_DIRECTION_LSB_LEFT;
+  }
+  if(bitRead(data_in, 3)) {
+    vertical_direction = VERTICAL_DIRECTION_MSB_BOTTOM;
+  }
+  else {
+    vertical_direction = VERTICAL_DIRECTION_LSB_BOTTOM;
+  }
+}
+
+/**
+*   \brief Converts microseconds into TCA0 value
+*   
+*   \param us Time in microseconds
+*
+*   \return Timer value
+**/
+uint16_t counter_us_to_val(uint16_t us) {
+  return us * 10;
+}
+
+void handle_reg_write(uint8_t data_in) {
+  if (reg_sel <= 6) {
+    reg_write(reg_sel, data_in);
+    reg_sel ++;
+    reg_sel = reg_sel % 7;
+  }
+  if (reg_sel == 8) {
+    set_protocol_config(data_in);
+  }
+  if (reg_sel == 9) {
+    int us_per_flip = (1000000/DUTCY_CYCLE_RATIO)/data_in;
+    us_per_flip -= 2*DEAD_TIME_US;
+    us_per_flip = constrain(us_per_flip, 1, 5000);
+    flip_on_time_us = us_per_flip;
+    TCA0.SINGLE.PER = counter_us_to_val(flip_on_time_us + DEAD_TIME_US); //count from top
+    TCA0.SINGLE.CMP0 = counter_us_to_val(DEAD_TIME_US); //compare at midpoint
+  }
+}
+
+void setup() {
+  _PROTECTED_WRITE(CLKCTRL_MCLKCTRLB, CLKCTRL_PEN_bm);  // Set 10 MHz clock
+
+  pinMode(RCLK, OUTPUT);
+  pinMode(SRCLR, OUTPUT);
+
+  pinMode(ADDR_0, INPUT_PULLUP);
+  pinMode(ADDR_1, INPUT_PULLUP);
+  pinMode(ADDR_2, INPUT_PULLUP);
+
+  address = digitalRead(ADDR_0) | digitalRead(ADDR_1) << 1 | digitalRead(ADDR_2) << 2;
+
+  digitalWrite(SRCLR, HIGH);
+  SPI.begin();
+  Serial.begin(115200);
+
+  takeOverTCA0();
+  //TCA0.SINGLE.CTRLB = (TCA_SINGLE_WGMODE_NORMAL_gc); //Normal mode counter - default
+  TCA0.SINGLE.CTRLESET = TCA_SINGLE_DIR_DOWN_gc;
+  TCA0.SINGLE.INTCTRL = (TCA_SINGLE_CMP0_bm | TCA_SINGLE_OVF_bm); // enable compare channel 0 and overflow interrupts
+
+  TCA0.SINGLE.PER = counter_us_to_val(flip_on_time_us + DEAD_TIME_US); //count from top
+  TCA0.SINGLE.CMP0 = counter_us_to_val(DEAD_TIME_US); //compare at midpoint
+
+  //TCA0.SINGLE.CTRLA = TCA_SINGLE_ENABLE_bm; // enable the timer 100ns increments per step at 10MHz clock
+
+  TCA0.SINGLE.CTRLA = 1;
+}
+
+// SERIAL PROTOCOL:
+// Module address and register selection:
+// 0b1AAARRRR
+// AAA - ADDRESS, RRRR = register
+// Register write:
+// 0b0VVVVVVV
+// VVVVVVV - Value
+//
+// Registers 0 - 6: Framebuffer
+//
+// Register 7: Redraw all segments and deselect module
+//
+// Register 8: Display configuration and deselect module- assumes vertical display and defaults to 0:
+// - Bit 0: raster mode
+//   - 0: 5-bit horizontal registers
+//   - 1: 7-bit vertical registers - uses registers 0-4
+// - Bit 1: Data justification in 5-bit register mode
+//   - 0: LSB justification
+//   - 1: MSB justification
+// - Bit 2: Horizontal direction
+//   - 0: LSB represents leftmost pixel
+//   - 1: MSB represents leftmost pixel
+// - Bit 3: Vertical direction
+//   - 0: LSB represents bottom pixel
+//   - 1: MSB represents bottom pixel
+//
+// Register 9: Display framerate and deselect module - sets time current is developed per pixel
+//                                                          Higer framerate means lower time and requires higher supply voltage
+//                                                          Duty cycle per pixel is fixed at 1%
+//                                                          Limited to 5 ms
+void loop() {
+  while (Serial.available()) {
+    data_in = Serial.read();
+    if (bitRead(data_in, 7)) {
+      handle_selection(data_in);
+    }
+    else if (reg_write_en) {
+      handle_reg_write(data_in);
+    }
+  }
+}
+
+ISR(TCA0_OVF_vect) {    // on overflow, shift out next frame
+  TCA0.SINGLE.CTRLA = 0;
+  for (int col = 0; col < MODULE_WIDTH; col++) {
+    for (int row = 0; row < MODULE_HEIGHT; row++) {
+      if (seg_cooldown[row][col] > 0) {
+        seg_cooldown[row][col] -= 1;
+        if (seg_cooldown[row][col] == 0) {
+          set_segment(col, row);
+        }
+      }
+    }
+  }
+
+  if (sr_queue_exec_index != sr_queue_write_index) {
+    next_sr_index(sr_queue_exec_index);
+    shift32(sr_queue[sr_queue_exec_index]);
+    clockRegisters();
+    sr_queue[sr_queue_exec_index] = 0;
+  }
+  TCA0.SINGLE.CTRLA = 1;
+  TCA0.SINGLE.INTFLAGS  = TCA_SINGLE_OVF_bm; // Always remember to clear the interrupt flags, otherwise the interrupt will fire continually!
+}
+
+
+ISR(TCA0_CMP0_vect) {    // on compare, shift 0
+  shift32(0);
+  clockRegisters();
+  TCA0.SINGLE.INTFLAGS  = TCA_SINGLE_CMP0_bm; // Always remember to clear the interrupt flags, otherwise the interrupt will fire continually!
+}

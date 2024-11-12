@@ -1,0 +1,7 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "Luckfox")(type "KiCad")(uri "${KIPRJMOD}/Footprints/Luckfox.pretty")(options "")(descr ""))
+  (lib (name "USB_4145")(type "KiCad")(uri "${KIPRJMOD}/Footprints/USB_4145.pretty")(options "")(descr ""))
+  (lib (name "TS12-74-60-BK-250-SMT-TR")(type "KiCad")(uri "${KIPRJMOD}/Footprints/TS12-74-60-BK-250-SMT-TR.pretty")(options "")(descr ""))
+  (lib (name "S8411-45")(type "KiCad")(uri "${KIPRJMOD}/Footprints/S8411-45.pretty")(options "")(descr ""))
+)
